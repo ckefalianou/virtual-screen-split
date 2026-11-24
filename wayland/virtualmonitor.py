@@ -8,11 +8,15 @@ import os
 import signal
 import sys
 
-import gi
+try:
+    import gi
 
-gi.require_version("Gst", "1.0")
-gi.require_version("Gtk", "4.0")
-from gi.repository import Gio, GLib, Gst, Gtk
+    gi.require_version("Gst", "1.0")
+    gi.require_version("Gtk", "4.0")
+    from gi.repository import Gio, GLib, Gst, Gtk
+except (ImportError, ValueError) as error:
+    print(f"Error: PyGObject with GTK 4 and GStreamer is required ({error}). See the requirements in the README.", file=sys.stderr)
+    sys.exit(1)
 
 SCREEN_CAST = "org.gnome.Mutter.ScreenCast"
 DISPLAY_CONFIG = "org.gnome.Mutter.DisplayConfig"
@@ -75,11 +79,20 @@ def primary_screen(state):
     fail("could not find the primary monitor.")
 
 
+def parse_whole_number(text, minimum, maximum):
+    """Returns the number, or None when the text is not a plain whole number in range."""
+    text = text.strip()
+    if not (text.isascii() and text.isdigit()):
+        return None
+    value = int(text)
+    return value if minimum <= value <= maximum else None
+
+
 def read_number(prompt, minimum, maximum):
-    value = input(prompt).strip()
-    if not value.isdigit() or not minimum <= int(value) <= maximum:
+    value = parse_whole_number(input(prompt), minimum, maximum)
+    if value is None:
         fail(f"enter a whole number from {minimum} to {maximum}.")
-    return int(value)
+    return value
 
 
 def choose_size(screen_width, screen_height):
@@ -118,6 +131,9 @@ class VirtualMonitorViewer:
         self.cursor = None
         self.pointer_call_pending = False
         self.retried_in_compatible_mode = False
+        self.exit_code = 0
+        self.connector_attempts = 0
+        self.connector_call_pending = False
 
         self.picture = Gtk.Picture(content_fit=Gtk.ContentFit.CONTAIN)
         self.cursor_layer = Gtk.DrawingArea(can_target=False)
@@ -162,7 +178,9 @@ class VirtualMonitorViewer:
         if self.use_gpu:
             print("Fast mode: frames stay on the GPU and the viewer draws the cursor.")
         else:
-            print(f"Compatible mode: frames are copied so GNOME can draw the cursor. {self.extension_status}")
+            print("Compatible mode: frames are copied so GNOME can draw the cursor.")
+        if self.extension_status:
+            print(self.extension_status)
         print(f"Virtual monitor: {self.width}x{self.height} at up to {self.framerate} fps. Close the viewer or press Ctrl+C to remove it.")
 
         add_signal_handler(signal.SIGINT, self.stop)
@@ -171,6 +189,8 @@ class VirtualMonitorViewer:
         self.loop.run()
         self.window.destroy()
         print("Virtual monitor removed.")
+        if self.exit_code:
+            sys.exit(self.exit_code)
 
     def on_stream_added(self, _connection, _sender, _path, _interface, _signal, parameters):
         if self.node_id is not None:
@@ -200,11 +220,19 @@ class VirtualMonitorViewer:
         caps = pad.get_current_caps()
         # Mutter embeds the cursor only into system-memory frames, so the viewer draws it only for GPU frames.
         self.gpu_frames = bool(caps) and caps.get_features(0).contains("memory:DMABuf")
+        GLib.idle_add(self.redraw_cursor)
+
+    def redraw_cursor(self):
+        self.cursor_layer.queue_draw()
+        return False
 
     def on_pipeline_error(self, _bus, message):
-        error = message.parse_error()[0].message
+        gst_error, debug_info = message.parse_error()
+        error = gst_error.message
         self.pipeline.set_state(Gst.State.NULL)
-        if self.use_gpu and not self.retried_in_compatible_mode:
+        details = f"{error} {debug_info or ''}".lower()
+        gpu_related = self.gpu_frames or "negotiat" in details or "dmabuf" in details or "dma-buf" in details
+        if self.use_gpu and gpu_related and not self.retried_in_compatible_mode:
             # Some drivers cannot share GPU frames with GTK, so the viewer retries with copied frames.
             print(f"GPU frames failed ({error}). Retrying in compatible mode.", file=sys.stderr)
             self.retried_in_compatible_mode = True
@@ -214,20 +242,46 @@ class VirtualMonitorViewer:
             self.build_pipeline()
             return
         print(f"Error: {error}", file=sys.stderr)
+        self.exit_code = 1
         self.stop()
 
     def find_own_connector(self):
         """Learns which virtual monitor belongs to this viewer, so another one is never tracked."""
-        new_connectors = virtual_connectors(read_display_state(self.bus)) - self.connectors_before
-        if len(new_connectors) == 1:
-            self.connector = new_connectors.pop()
+        if self.pipeline is None or self.connector is not None:
             return False
-        return self.pipeline is not None
+        self.connector_attempts += 1
+        if self.connector_attempts > 40:
+            print("Warning: could not identify the virtual monitor, so the viewer will not draw the cursor.", file=sys.stderr)
+            return False
+        if not self.connector_call_pending:
+            self.connector_call_pending = True
+            self.bus.call(
+                DISPLAY_CONFIG, "/org/gnome/Mutter/DisplayConfig", DISPLAY_CONFIG, "GetCurrentState",
+                None, None, Gio.DBusCallFlags.NONE, 2000, None, self.on_display_state,
+            )
+        return True
+
+    def on_display_state(self, bus, result):
+        self.connector_call_pending = False
+        try:
+            state = bus.call_finish(result).unpack()
+        except GLib.Error:
+            return
+        new_connectors = virtual_connectors(state) - self.connectors_before
+        # Another tool may add a virtual monitor at the same time, so the size breaks the tie.
+        matching_size = {
+            spec[0] for spec, modes, _properties in state[1]
+            if spec[0] in new_connectors
+            and any(mode[6].get("is-current") and (mode[1], mode[2]) == (self.width, self.height) for mode in modes)
+        }
+        candidates = matching_size if len(new_connectors) > 1 else new_connectors
+        if len(candidates) == 1:
+            self.connector = candidates.pop()
 
     def poll_pointer(self):
-        if self.pipeline is None:
+        if self.pipeline is None or not self.use_gpu:
             return False
-        if self.pointer_call_pending or not self.use_gpu or not self.window.get_mapped():
+        if self.pointer_call_pending or not self.window.get_mapped():
             return True
         self.pointer_call_pending = True
         self.bus.call(
@@ -292,10 +346,9 @@ def pointer_extension_answers(bus):
 
 
 def main():
-    framerate_text = os.environ.get("FRAMERATE", "30")
-    if not framerate_text.isdigit() or not 1 <= int(framerate_text) <= 240:
+    framerate = parse_whole_number(os.environ.get("FRAMERATE", "30"), 1, 240)
+    if framerate is None:
         fail("FRAMERATE must be a whole number from 1 to 240.")
-    framerate = int(framerate_text)
     extension_status = os.environ.get("EXTENSION_STATUS", "")
 
     Gst.init(None)
@@ -313,9 +366,13 @@ def main():
         print()
         sys.exit(1)
 
-    use_gpu = os.environ.get("COMPATIBLE") != "1" and pointer_extension_answers(bus)
     if os.environ.get("COMPATIBLE") == "1":
+        use_gpu = False
         extension_status = "COMPATIBLE=1 is set."
+    else:
+        use_gpu = pointer_extension_answers(bus)
+        if not use_gpu and not extension_status:
+            extension_status = "The cursor helper extension is active but did not answer. Check: journalctl --user -b | grep pointer-position"
     VirtualMonitorViewer(bus, width, height, scale, framerate, use_gpu, extension_status).start()
 
 

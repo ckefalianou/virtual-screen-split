@@ -49,27 +49,58 @@ if uuid in disabled:
 PY
 }
 
+# Copies the extension through a temporary folder, so a failed copy never removes the installed one.
+install_extension_files() {
+    local staging
+    mkdir -p "$(dirname "$EXTENSION_TARGET")" || return 1
+    staging=$(mktemp -d "$(dirname "$EXTENSION_TARGET")/.${EXTENSION_UUID}.XXXXXX" 2>/dev/null) || return 1
+    if ! cp -r "$EXTENSION_SOURCE/." "$staging/"; then
+        rm -rf "$staging"
+        return 1
+    fi
+    chmod 755 "$staging"
+    rm -rf "$EXTENSION_TARGET" && mv "$staging" "$EXTENSION_TARGET"
+}
+
 # Installs the extension, or replaces an installed copy that differs from the one next to this script.
-# Returns a short reason when the extension cannot be active in this session.
+# Prints a short reason when the extension cannot be active in this session.
 prepare_extension() {
     if [ ! -d "$EXTENSION_SOURCE" ]; then
         echo "The cursor helper extension folder is missing next to the script."
         return
     fi
 
-    if ! diff -rq "$EXTENSION_SOURCE" "$EXTENSION_TARGET" >/dev/null 2>&1; then
-        rm -rf "$EXTENSION_TARGET"
-        mkdir -p "$(dirname "$EXTENSION_TARGET")"
-        cp -r "$EXTENSION_SOURCE" "$EXTENSION_TARGET"
+    local user_extensions_note=""
+    if [ "$(gsettings get org.gnome.shell disable-user-extensions 2>/dev/null)" = "true" ]; then
+        user_extensions_note=" User extensions are turned off. Turn them on in the Extensions app."
+    fi
+
+    local action=""
+    if [ ! -d "$EXTENSION_TARGET" ]; then
+        action="installed"
+    else
+        diff -rq "$EXTENSION_SOURCE" "$EXTENSION_TARGET" >/dev/null 2>&1
+        case $? in
+            0) ;;
+            1) action="updated" ;;
+            *) echo "Could not compare the installed cursor helper extension with the one next to the script."; return ;;
+        esac
+    fi
+
+    if [ -n "$action" ]; then
+        if ! install_extension_files; then
+            echo "Could not copy the cursor helper extension to $EXTENSION_TARGET."
+            return
+        fi
         enable_extension
-        echo "The cursor helper extension was just installed or updated. Log out and back in once to activate it."
+        echo "The cursor helper extension was just $action. Log out and back in once to activate it.$user_extensions_note"
         return
     fi
 
     enable_extension
 
-    if [ "$(gsettings get org.gnome.shell disable-user-extensions 2>/dev/null)" = "true" ]; then
-        echo "User extensions are turned off. Turn them on in the Extensions app."
+    if [ -n "$user_extensions_note" ]; then
+        echo "${user_extensions_note# }"
         return
     fi
 
@@ -85,8 +116,5 @@ prepare_extension() {
 }
 
 EXTENSION_STATUS="$(prepare_extension)"
-if [[ "$EXTENSION_STATUS" == *"just installed or updated"* ]]; then
-    echo "$EXTENSION_STATUS"
-fi
 
 EXTENSION_STATUS="$EXTENSION_STATUS" exec python3 -I "$SCRIPT_DIR/virtualmonitor.py"
