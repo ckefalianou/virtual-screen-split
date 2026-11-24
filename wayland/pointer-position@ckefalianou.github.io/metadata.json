@@ -1,0 +1,9 @@
+{
+  "uuid": "pointer-position@ckefalianou.github.io",
+  "name": "Pointer Position for Virtual Monitor",
+  "description": "Companion for the virtual-monitor script. While the pointer is on a virtual monitor, it shares the pointer position over D-Bus so the script's viewer can draw the cursor. It shares nothing while the pointer is on a real monitor.",
+  "shell-version": [
+    "50"
+  ],
+  "url": "https://github.com/ckefalianou/virtual-screen-split"
+}
