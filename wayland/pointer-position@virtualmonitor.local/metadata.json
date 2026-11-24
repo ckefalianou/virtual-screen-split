@@ -1,6 +1,0 @@
-{
-  "uuid": "pointer-position@virtualmonitor.local",
-  "name": "Pointer Position for Virtual Monitor",
-  "description": "Shares the pointer position over D-Bus so virtualmonitor-wayland.sh can draw the cursor in its viewer.",
-  "shell-version": ["50"]
-}
